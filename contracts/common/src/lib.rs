@@ -176,6 +176,7 @@ pub enum Error {
     /// The strategy still holds deployed principal, so it cannot be replaced
     /// or revoked yet (issue #415).
     StrategyHasPrincipal = 323,
+<<<<<<< HEAD
     /// No escrow record exists for the NFT contract/token id (issue #474).
     NftEscrowNotFound = 324,
     /// The NFT contract/token id is already escrowed in this vault
@@ -198,6 +199,10 @@ pub enum Error {
     /// (issue #431). The window is bounded so a hostile party cannot stall
     /// settlement indefinitely by resubmitting newer states.
     DisputeExtensionLimitReached = 417,
+    /// The requested coupon id does not exist in persistent storage.
+    CouponNotFound = 418,
+    /// The coupon has already been redeemed and cannot be applied again.
+    CouponAlreadyRedeemed = 419,
     /// Explicit Soroban Host error mapping (issue #380).
     HostError = 500,
 }
