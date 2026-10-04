@@ -176,7 +176,6 @@ pub enum Error {
     /// The strategy still holds deployed principal, so it cannot be replaced
     /// or revoked yet (issue #415).
     StrategyHasPrincipal = 323,
-<<<<<<< HEAD
     /// No escrow record exists for the NFT contract/token id (issue #474).
     NftEscrowNotFound = 324,
     /// The NFT contract/token id is already escrowed in this vault
