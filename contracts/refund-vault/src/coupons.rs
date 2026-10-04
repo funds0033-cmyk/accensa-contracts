@@ -121,7 +121,12 @@ pub fn mint_coupon(
 /// verified, so that a failure after this point (e.g. the token transfer
 /// reverting) still rolls back the storage write via the host's atomic
 /// transaction semantics.
-pub fn apply_coupon(env: &Env, caller: &Address, coupon_id: u64, amount: i128) -> Result<i128, Error> {
+pub fn apply_coupon(
+    env: &Env,
+    caller: &Address,
+    coupon_id: u64,
+    amount: i128,
+) -> Result<i128, Error> {
     let key = DataKey::Coupon(coupon_id);
     let mut record: CouponRecord = env
         .storage()
@@ -138,9 +143,7 @@ pub fn apply_coupon(env: &Env, caller: &Address, coupon_id: u64, amount: i128) -
 
     // discount = floor(amount * discount_bps / 10_000)
     let discount = apply_fee_bps(amount, record.discount_bps).map_err(Error::from)?;
-    let effective_amount = amount
-        .checked_sub(discount)
-        .ok_or(Error::MathOverflow)?;
+    let effective_amount = amount.checked_sub(discount).ok_or(Error::MathOverflow)?;
 
     // Consume the coupon — single-use.
     record.redeemed = true;
@@ -155,9 +158,7 @@ pub fn apply_coupon(env: &Env, caller: &Address, coupon_id: u64, amount: i128) -
 /// Read-only accessor for a coupon record. Returns `None` when the coupon id
 /// does not exist or its persistent entry has expired.
 pub fn get_coupon(env: &Env, coupon_id: u64) -> Option<CouponRecord> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Coupon(coupon_id))
+    env.storage().persistent().get(&DataKey::Coupon(coupon_id))
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────
