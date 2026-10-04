@@ -1078,7 +1078,12 @@ impl RefundVault {
         current_user_nonce(&env, &caller)
     }
 
-    pub fn deposit(env: Env, from: Address, amount: i128, coupon_id: Option<u64>) -> Result<(), Error> {
+    pub fn deposit(
+        env: Env,
+        from: Address,
+        amount: i128,
+        coupon_id: Option<u64>,
+    ) -> Result<(), Error> {
         accensa_common::reentrancy::ReentrancyGuard::acquire(&env)?;
 
         if env
