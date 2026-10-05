@@ -38,7 +38,12 @@ pub struct RefundParam {
     pub vdf_proof: Option<BytesN<256>>,
 }
 
-#[contracttype]
+// `export = false`: the vault's storage keys are internal. No entry point takes
+// or returns one, so publishing them would only inflate the wasm — and the
+// contract-spec text is embedded in the wasm, which is capped at Stellar's
+// 128 KiB contract-code limit. The live layout is documented in
+// `docs/storage-audit.md`.
+#[contracttype(export = false)]
 pub enum DataKey {
     Admin,
     /// Per-instance domain separator (issue #136): `sha256(contract_address)`,
@@ -146,6 +151,11 @@ pub enum DataKey {
     /// Treasury receiving swept dust (issue #427). Falls back to the fee
     /// recipient when unset.
     DustTreasury,
+    /// Escrow record for an NFT held by the vault (issue #474). Keyed by the
+    /// exact `(nft_contract, token_id)` pair so the released asset is always
+    /// the deposited one; the value is the escrow's parties
+    /// ([`nft_escrow::NftEscrowRecord`]).
+    NftEscrow(Address, u128),
     /// Whitelist flag for a yield strategy (issue #415). Only approved
     /// strategies can be registered or receive deployments. Persistent.
     ApprovedStrategy(Address),
@@ -153,6 +163,19 @@ pub enum DataKey {
     /// rebate pool (issue #415). Falls back to the merchant when unset.
     /// Persistent.
     YieldRecipient,
+    /// The merchant's fee ladder: a strictly increasing `Vec<MerchantTier>`.
+    /// Instance storage. Absent until the merchant installs one, in which case
+    /// the flat [`DataKey::FeeBps`] rate applies unchanged.
+    TierLadder,
+    /// The merchant's cached position on the fee ladder. Instance storage;
+    /// mirrors the active rung's fee and the next promotion threshold so the
+    /// claim hot path reads one small value instead of decoding the whole
+    /// ladder on every claim. See `tiers`.
+    TierState,
+    /// On-chain discount coupon NFT record (issue #453). Keyed by the
+    /// merchant-assigned coupon id (u64). Persistent: survives across ledger
+    /// epochs because a coupon may be redeemed long after it is minted.
+    Coupon(u64),
 }
 
 #[contracttype]
@@ -460,12 +483,37 @@ pub struct CommitRevealedEvent {
     pub ledger: u32,
 }
 
+/// Emitted when a discount coupon NFT is applied to a deposit (issue #453).
+///
+/// Topics: `("coupon_applied_event", coupon_id, holder)`. The data map
+/// records both amounts so indexers can reconstruct the discount without
+/// re-computing basis-point math.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CouponAppliedEvent {
+    #[topic]
+    pub coupon_id: u64,
+    #[topic]
+    pub holder: Address,
+    /// The gross deposit amount supplied by the merchant.
+    pub original_amount: i128,
+    /// The net amount actually transferred to the vault after the discount.
+    pub effective_amount: i128,
+    /// Discount rate in basis points that was applied.
+    pub discount_bps: u32,
+}
+
+pub mod coupons;
 pub mod dust;
+pub mod flash_loan;
+pub mod nft_escrow;
 pub mod oracle;
 pub mod settlement;
 
 pub mod strategy;
 pub use strategy::{YieldStrategy, YieldStrategyClient};
+
+pub mod tiers;
 
 /// Approximately 30 days of ledgers, assuming ~5 seconds per ledger.
 /// 60 * 60 * 24 * 30 / 5 = 518,400.
@@ -639,6 +687,10 @@ struct PolicyCache {
     vdf_policy_contract: Option<Address>,
     token_addr: Address,
     fee_bps: u32,
+    /// Whether a merchant fee ladder is installed. When `false` the claim path
+    /// skips tier bookkeeping entirely, so a vault with no ladder pays nothing
+    /// per claim for the tier feature.
+    tiers_active: bool,
 }
 
 /// Read all policy-level instance-storage keys once and return a
@@ -650,6 +702,21 @@ struct PolicyCache {
 /// their use sites, so `PolicyContractsNotConfigured` is still raised only
 /// when the corresponding gate is actually active.
 fn read_policy_cache(env: &Env) -> PolicyCache {
+    // Resolve the merchant fee ladder once. The effective fee and the
+    // "is a ladder installed?" flag come from the same tier-state read, so a
+    // vault without tiers pays one instance load per entry point — and nothing
+    // per claim, since `claim_single` skips tier bookkeeping when there is no
+    // ladder. With no ladder the flat `FeeBps` config applies, exactly as
+    // before. Sharing the resolved fee across a batch also makes promotion
+    // deterministic within a call: a rung crossed by claim N takes effect from
+    // claim N+1 on.
+    let tier_state = tiers::state(env);
+    let fee_bps = match &tier_state {
+        Some(state) => state.fee_bps,
+        None => env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
+    };
+    let tiers_active = tier_state.is_some();
+
     PolicyCache {
         refund_window: env
             .storage()
@@ -670,7 +737,8 @@ fn read_policy_cache(env: &Env) -> PolicyCache {
             .unwrap_or(0),
         vdf_policy_contract: env.storage().instance().get(&DataKey::VdfPolicyContract),
         token_addr: env.storage().instance().get(&DataKey::Token).unwrap(),
-        fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
+        fee_bps,
+        tiers_active,
     }
 }
 
@@ -893,6 +961,15 @@ fn claim_single(env: &Env, cache: &PolicyCache, claim: &RefundClaim) -> Result<(
     }
     .publish(env);
 
+    // Merchant tier promotion: accrue the gross volume this claim settled and
+    // promote the merchant if it crossed the next rung. This runs only after
+    // the transfers and record write succeeded, so a claim that fails any gate
+    // above never counts toward a promotion. Skipped entirely when the vault
+    // has no ladder, so an untiered vault pays nothing extra per claim.
+    if cache.tiers_active {
+        tiers::on_settled(env, claim.amount);
+    }
+
     Ok(())
 }
 
@@ -1001,7 +1078,12 @@ impl RefundVault {
         current_user_nonce(&env, &caller)
     }
 
-    pub fn deposit(env: Env, from: Address, amount: i128) -> Result<(), Error> {
+    pub fn deposit(
+        env: Env,
+        from: Address,
+        amount: i128,
+        coupon_id: Option<u64>,
+    ) -> Result<(), Error> {
         accensa_common::reentrancy::ReentrancyGuard::acquire(&env)?;
 
         if env
@@ -1027,6 +1109,27 @@ impl RefundVault {
         }
         admin.require_auth();
 
+        // Apply a discount coupon when one is supplied. The coupon is marked
+        // redeemed atomically here — inside the reentrancy lock and after all
+        // preconditions have passed — so a subsequent token-transfer failure
+        // rolls back the storage write via the host's atomic transaction.
+        let effective_amount = if let Some(id) = coupon_id {
+            let rec = coupons::get_coupon(&env, id).ok_or(Error::CouponNotFound)?;
+            let discount_bps = rec.discount_bps;
+            let eff = coupons::apply_coupon(&env, &from, id, amount)?;
+            CouponAppliedEvent {
+                coupon_id: id,
+                holder: from.clone(),
+                original_amount: amount,
+                effective_amount: eff,
+                discount_bps,
+            }
+            .publish(&env);
+            eff
+        } else {
+            amount
+        };
+
         let token_address: Address = env
             .storage()
             .instance()
@@ -1034,13 +1137,13 @@ impl RefundVault {
             .ok_or(Error::NotInitialized)?;
         let token_client = token::Client::new(&env, &token_address);
         let contract_addr = env.current_contract_address();
-        token_client.transfer(&admin, &contract_addr, &amount);
+        token_client.transfer(&admin, &contract_addr, &effective_amount);
 
         let nonce = increment_nonce(&env);
 
         DepositEvent {
             from: from.clone(),
-            amount,
+            amount: effective_amount,
             nonce,
         }
         .publish(&env);
@@ -1048,6 +1151,44 @@ impl RefundVault {
         extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         accensa_common::reentrancy::ReentrancyGuard::release(&env);
         Ok(())
+    }
+
+    /// Mint a new discount coupon NFT for `owner` (issue #453).
+    ///
+    /// Only the vault admin (merchant) may call this. The `coupon_id` must be
+    /// unique within this vault instance; ids are chosen by the merchant.
+    /// `discount_bps` is the discount rate in basis points
+    /// (max [`coupons::MAX_COUPON_DISCOUNT_BPS`] = 50 %).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotInitialized`] — vault not yet initialized.
+    /// - [`Error::Unauthorized`] — caller is not the vault admin.
+    /// - [`Error::InvalidRatio`] — `discount_bps` exceeds the maximum.
+    /// - [`Error::AlreadyInitialized`] — `coupon_id` already exists.
+    pub fn mint_coupon(
+        env: Env,
+        coupon_id: u64,
+        owner: Address,
+        discount_bps: u32,
+    ) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        coupons::mint_coupon(&env, coupon_id, owner, discount_bps)?;
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
+        Ok(())
+    }
+
+    /// Read the coupon record for `coupon_id`, or `None` if it does not exist.
+    ///
+    /// This is a read-only query — no auth required.
+    pub fn get_coupon(env: Env, coupon_id: u64) -> Option<coupons::CouponRecord> {
+        coupons::get_coupon(&env, coupon_id)
     }
 
     pub fn set_token(env: Env, new_token: Address) -> Result<(), Error> {
@@ -1070,24 +1211,65 @@ impl RefundVault {
         Ok(())
     }
 
+    /// Escrow a Soroban NFT into the vault alongside the fungible float
+    /// (issue #474). `merchant` (the vault admin) deposits `token_id` from
+    /// `nft_contract` and binds it to `buyer`; only `buyer` may later redeem
+    /// it via [`Self::refund_nft`], and only `merchant` may reclaim it via
+    /// [`Self::claim_nft`].
+    pub fn deposit_nft(
+        env: Env,
+        merchant: Address,
+        buyer: Address,
+        nft_contract: Address,
+        token_id: u128,
+    ) -> Result<(), Error> {
+        nft_escrow::deposit(&env, &merchant, &buyer, &nft_contract, token_id)
+    }
+
+    /// Reclaim an escrowed NFT (cancellation / return). Callable only by the
+    /// merchant who escrowed it. Returns the exact `token_id` released, so
+    /// the returned asset is always the deposited one (issue #474).
+    pub fn claim_nft(
+        env: Env,
+        merchant: Address,
+        nft_contract: Address,
+        token_id: u128,
+    ) -> Result<u128, Error> {
+        nft_escrow::claim(&env, &merchant, &nft_contract, token_id)
+    }
+
+    /// Refund an escrowed NFT to the buyer it was escrowed for. Callable only
+    /// by that buyer. Returns the exact `token_id` released (issue #474).
+    pub fn refund_nft(
+        env: Env,
+        buyer: Address,
+        nft_contract: Address,
+        token_id: u128,
+    ) -> Result<u128, Error> {
+        nft_escrow::refund(&env, &buyer, &nft_contract, token_id)
+    }
+
+    /// Read-only: the escrow record for `(nft_contract, token_id)`, or
+    /// `None` if that NFT is not escrowed.
+    pub fn get_nft_escrow(
+        env: Env,
+        nft_contract: Address,
+        token_id: u128,
+    ) -> Option<nft_escrow::NftEscrowRecord> {
+        nft_escrow::get(&env, &nft_contract, token_id)
+    }
+
     /// Refund part (or all) of an original payment.
     ///
-    /// `payment_amount` is the original payment amount and therefore the hard
-    /// ceiling: cumulative refunds for a payment may never exceed it. It is
-    /// supplied by the merchant on **every** call, mirroring how `paid_at_ledger`
-    /// is supplied, so the ceiling never depends on partial bookkeeping. The
-    /// refund window is evaluated against `paid_at_ledger` (the original
-    /// payment), not against a previous partial — each partial does not extend
-    /// the window for the next.
+    /// `payment_amount` is the original amount and therefore the hard ceiling
+    /// on cumulative refunds; like `paid_at_ledger` it is supplied on every
+    /// call, so the ceiling never depends on partial bookkeeping. The window is
+    /// evaluated against `paid_at_ledger`, so a partial never extends it. Thin
+    /// wrapper around the same claim path as [`RefundVault::claim_batch`].
     ///
-    /// This is a thin wrapper around the same shared claim path as
-    /// [`RefundVault::claim_batch`].
-    ///
-    /// Storage note (#99): the layout changed from a single `amount` record to a
-    /// cumulative record under a new `RefundV2` key. A `Refund` key written by
-    /// the legacy single-refund rule still denotes a fully-refunded payment and
-    /// is rejected with [`Error::ExceedsPayment`] rather than a silent
-    /// misinterpretation.
+    /// Storage note (#99): a legacy single-refund `Refund` key still denotes a
+    /// fully-refunded payment and is rejected with [`Error::ExceedsPayment`]
+    /// rather than misread.
     pub fn refund(
         env: Env,
         payment_ref: BytesN<32>,
@@ -1135,28 +1317,15 @@ impl RefundVault {
 
     /// Refund multiple claims in a single transaction.
     ///
-    /// Every element of `claims` is processed in order with exactly the same
-    /// logic as a [`RefundVault::refund`] call — validations, ceilings, fees,
-    /// the float check, cumulative-record storage, TTL extension and a
-    /// [`RefundEvent`] per element — so the whole batch shares one merchant
-    /// authorization and one reentrancy-lock acquisition. Unrelated
-    /// `payment_ref`s are independent; repeated refs accumulate against the
-    /// same ceiling across elements.
+    /// Each element is processed in order with exactly the same logic as
+    /// [`RefundVault::refund`], so the batch shares one merchant authorization
+    /// and one reentrancy lock; unrelated refs are independent, and repeated
+    /// refs accumulate against the same ceiling. The float is re-read per
+    /// element, so a batch cannot overdraw the vault more than the equivalent
+    /// sequence of single refunds.
     ///
-    /// The float is read afresh from the token contract before every element,
-    /// so a batch can never overdraw the vault any more than an equivalent
-    /// sequence of single refunds, and `paid_at_ledger` / `payment_amount` are
-    /// evaluated per claim.
-    ///
-    /// # Atomicity
-    ///
-    /// If any element fails, the call returns that error. A contract error
-    /// reverts the entire Soroban invocation — including the token transfers,
-    /// storage writes and events of the claims that already succeeded within
-    /// this call — so the batch is all-or-nothing: either every claim
-    /// persists, or none of them do.
-    ///
-    /// An empty `claims` vector succeeds as a no-op.
+    /// Atomic: a failing element's error reverts the whole invocation, token
+    /// transfers and events included. An empty `claims` vector is a no-op.
     pub fn claim_batch(env: Env, claims: Vec<RefundClaim>, nonce: u64) -> Result<(), Error> {
         if claims.len() > MAX_BATCH_SIZE {
             return Err(Error::BatchTooLarge);
@@ -2448,6 +2617,26 @@ impl RefundVault {
         dust::sweep_dust(&env, payment_ref)
     }
 
+    /// Flash-borrow `amount` of the vault's liquid float (issue #442). The
+    /// tokens are sent to `receiver`, whose `on_flash_loan` callback must
+    /// return `amount` plus a 0.09% premium to the vault before this call
+    /// ends; the premium is forwarded to the fee recipient. Merchant (admin)
+    /// only. Returns the premium charged.
+    ///
+    /// # Errors
+    /// - `InvalidAmount`: `amount <= 0`.
+    /// - `SelfTransfer`: `receiver` is the vault itself.
+    /// - `InsufficientFloat`: `amount` exceeds the liquid float, or the
+    ///   receiver did not repay `amount + fee` (the loan is reverted).
+    pub fn flash_loan(
+        env: Env,
+        receiver: Address,
+        amount: i128,
+        data: Bytes,
+    ) -> Result<i128, Error> {
+        flash_loan::flash_loan(&env, receiver, amount, data)
+    }
+
     pub fn extend_refund_ttl(env: Env, payment_ref: BytesN<32>) -> Result<(), Error> {
         let record: RefundRecord = env
             .storage()
@@ -2543,6 +2732,8 @@ impl RefundVault {
 #[cfg(test)]
 mod dust_tests;
 #[cfg(test)]
+mod flash_loan_tests;
+#[cfg(test)]
 mod fuzz_test;
 #[cfg(test)]
 mod oracle_tests;
@@ -2557,7 +2748,11 @@ mod strategy_tests;
 mod test;
 #[cfg(test)]
 mod test_helpers;
+#[cfg(test)]
+mod tier_tests;
+#[cfg(test)]
 mod token_agnostic_tests;
+#[cfg(test)]
 mod yield_tests;
 
 /// Security audit tests for the commit-reveal scheme (issue #128): simulate

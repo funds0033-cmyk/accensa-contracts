@@ -80,7 +80,19 @@ fn budget_deposit() {
     let env = Env::default();
     let (client, merchant, _token) = setup(&env, 100);
     env.cost_estimate().budget().reset_unlimited();
-    client.deposit(&merchant, &600_000);
+    client.deposit(&merchant, &600_000, &None);
+}
+
+#[test]
+#[budget_cpu_lt(1_700_000)]
+fn budget_deposit_with_coupon() {
+    let env = Env::default();
+    let (client, merchant, _token) = setup(&env, 100);
+    // Mint a 10% discount coupon for the merchant
+    client.mint_coupon(&1, &merchant, &1_000);
+    env.cost_estimate().budget().reset_unlimited();
+    // Deposit with the coupon - should measure coupon application overhead
+    client.deposit(&merchant, &600_000, &Some(1));
 }
 
 #[test]
@@ -88,7 +100,7 @@ fn budget_deposit() {
 fn budget_refund() {
     let env = Env::default();
     let (client, merchant, _token) = setup(&env, 100);
-    client.deposit(&merchant, &500_000);
+    client.deposit(&merchant, &500_000, &None);
     let payment_ref = BytesN::from_array(&env, &[7u8; 32]);
     let buyer = Address::generate(&env);
     env.cost_estimate().budget().reset_unlimited();

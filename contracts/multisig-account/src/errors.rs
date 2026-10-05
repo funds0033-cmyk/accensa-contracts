@@ -36,4 +36,7 @@ pub enum Error {
     /// A signer was added that is already registered on the account
     /// (issue #434).
     SignerAlreadyRegistered = 13,
+    /// An approval aged past the stale-signature TTL (14 days) and no longer
+    /// counts toward the threshold; re-collect the approvals (issue #449).
+    StaleSignature = 14,
 }

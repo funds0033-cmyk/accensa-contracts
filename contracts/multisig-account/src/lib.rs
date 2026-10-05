@@ -17,6 +17,8 @@
 //! - Governance may set a per-token daily allowance ([`limits`]); a routine
 //!   token transfer authorized by fewer than `threshold` signers is then
 //!   accepted while it fits in each signer's remaining daily quota.
+//! - Approvals of a queued timelock transaction expire after 14 days
+//!   ([`ttl`]); stale ones are pruned before the quorum is evaluated.
 //!
 //! This is the piece referenced by `docs/SECURITY_MODEL.md` and
 //! `DEPLOYMENTS.md`: initialize an app contract with the multisig account's
@@ -30,6 +32,7 @@ mod errors;
 pub mod limits;
 mod signers;
 pub mod timelock;
+pub mod ttl;
 pub mod weights;
 
 pub use admin::{GuardianSetEvent, PausedEvent, UnpausedEvent};
@@ -62,7 +65,9 @@ pub enum DataKey {
     /// (issue #434). Soroban storage cannot be iterated, so the aggregate
     /// signer weight needs this materialized list.
     SignerList,
-    /// Temporary storage per approval: marks a signer has approved a queued transaction.
+    /// Persistent storage per approval: the signer's approval of a queued
+    /// transaction, stamped with `created_at` (`ttl::ApprovalRecord`), so it
+    /// can be expired after the 14-day TTL (issue #449).
     TimelockApproval(u64, Address),
     /// Instance: the next available queue ID counter.
     QueueCount,

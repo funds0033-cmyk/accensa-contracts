@@ -104,7 +104,11 @@ fn build_tree(env: &Env, depth: u32) -> (BytesN<32>, Vec<BytesN<32>>) {
     let mut proof = vec![env];
     let mut idx = 0usize;
     while layer.len() > 1 {
-        let sibling = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let sibling = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
         proof.push_back(layer.get(sibling as u32).unwrap());
         let mut next: Vec<BytesN<32>> = Vec::new(env);
         let mut i = 0;
