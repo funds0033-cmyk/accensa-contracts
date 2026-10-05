@@ -9,6 +9,7 @@ breaking changes bump the **minor** version, and they are called out as such.
 ## [Unreleased]
 
 - security(multisig): implement 14-day TTL expiration for pending signatures and approvals (#449)
+- **`refund-vault` (issue #453): Discount Coupon NFTs for Merchant Stores.** New coupon system allows merchants to issue discount NFTs that buyers can redeem during refund claims. `issue_coupon` creates a coupon with a discount percentage and optional expiration, `redeem_coupon` applies the discount to a refund claim (deducted from the payout), and `invalidate_coupon` lets merchants revoke unused coupons. Coupons are single-use (marked `redeemed` after use) and tracked in persistent storage with new error codes `CouponNotFound` (418) and `CouponAlreadyRedeemed` (419).
 
 ### Added
 - **`privacy` (issue #440): Groth16 verification for concealed escrow amounts.**
