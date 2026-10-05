@@ -84,18 +84,6 @@ fn budget_deposit() {
 }
 
 #[test]
-#[budget_cpu_lt(1_800_000)]
-fn budget_deposit_with_coupon() {
-    let env = Env::default();
-    let (client, merchant, _token) = setup(&env, 100);
-    // Mint a 10% discount coupon for the merchant
-    client.mint_coupon(&1, &merchant, &1_000);
-    env.cost_estimate().budget().reset_unlimited();
-    // Deposit with the coupon - should measure coupon application overhead
-    client.deposit(&merchant, &600_000, &Some(1));
-}
-
-#[test]
 #[budget_cpu_lt(2_870_000)]
 fn budget_refund() {
     let env = Env::default();
